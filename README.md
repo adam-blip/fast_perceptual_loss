@@ -44,32 +44,6 @@ pip install -r requirements.txt
 python main.py
 ```
 
-<a href="https://colab.research.google.com/github/yourusername/FastPerceptualLoss/blob/main/examples/demo.ipynb">
-  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
-</a>
-
-## Model Training
-```python
-# Create and train the model
-from model import create_fast_perceptual_model
-from training_core import train_fast_perceptual_model
-
-# Create models
-vgg_model = VGG19(include_top=False, weights='imagenet', input_shape=(None, None, 3))
-model = create_fast_perceptual_model(input_shape=(None, None, 3))
-
-# Train the model
-train_fast_perceptual_model(
-    model,
-    vgg_model,
-    dataset_folder="your_dataset_folder",
-    batch_size_var=4,  # Initial batch size
-    epochs=250,
-    steps_per_epoch=100,
-    initial_lr=0.005
-)
-```
-
 ## Model Integration
 You can use the trained model in your image processing pipeline:
 ```python
@@ -91,7 +65,7 @@ def fast_perceptual_loss(y_true, y_pred):
 ## 📊 Enhanced FastPerceptualLoss vs VGG19 Comparison
 | Feature | 🏎️ FastPerceptualLoss | 🐢 VGG19 (up to block3_conv3) |
 |---------|------------------------|------------------------------|
-| Parameters | ~50,000 | ~5,400,000 |
+| Parameters | ~25,000 | ~5,400,000 |
 | Memory Footprint | ~220 KB | ~21 MB |
 | Inference Speed | ~5-10x faster | Baseline |
 | Feature Accuracy | 93-96% correlation with VGG | 100% (reference) |
@@ -100,21 +74,6 @@ def fast_perceptual_loss(y_true, y_pred):
 | Real-time Applications | ✅ Yes | ❌ Limited by compute |
 | Advanced Attention | ✅ Yes | ❌ No |
 | Adaptive Receptive Field | ✅ Yes | ❌ No |
-
-### Performance Comparison
-Our enhanced model achieves even better feature extraction quality while maintaining computational efficiency:
-- **108x fewer parameters** than the equivalent VGG19 feature extractor
-- **Maintains >93% feature space correlation** with the original VGG19 features
-- **5-10x inference speed improvement** on identical hardware
-- **Mobile-friendly architecture** with minimal memory requirements
-- **Less than 5% overhead** compared to the original FastPerceptualLoss implementation
-
-## Improved Learning Rate Adaptation
-The new learning rate scheduler offers:
-- **Trend Detection**: Uses linear regression to detect loss patterns before they become significant
-- **Early Response**: Reacts to upward trends as small as 3% (down from 10%)
-- **Graduated Response**: Scales learning rate reduction based on the magnitude of loss increase
-- **Smoother Warmup**: Uses cubic curve instead of linear for more controlled learning rate increase
 
 ## 📊 Visualization
 The training interface provides comprehensive real-time visualizations:
