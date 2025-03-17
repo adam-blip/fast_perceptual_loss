@@ -14,7 +14,7 @@ import datetime
 import json
 from model import create_fast_perceptual_model
 from training_core import train_fast_perceptual_model
-from globals import log_queue, stop_training, current_batch_size
+from globals import log_queue, stop_training, current_batch_size, default_epochs, default_steps_per_epoch, default_learning_rate
 
 def create_gui():
     root = tk.Tk()
@@ -83,18 +83,18 @@ def create_gui():
 
     # Epochs in same row
     ttk.Label(params_grid, text="Epochs:", font=('TkDefaultFont', 9)).grid(row=0, column=2, sticky=tk.W, padx=2, pady=1)
-    epochs_var = tk.IntVar(value=250)
+    epochs_var = tk.IntVar(value=default_epochs)
     epochs_entry = ttk.Entry(params_grid, textvariable=epochs_var, width=5)
     epochs_entry.grid(row=0, column=3, sticky=tk.W, padx=2, pady=1)
 
     # Row 2: Steps per epoch and learning rate
     ttk.Label(params_grid, text="Steps/Epoch:", font=('TkDefaultFont', 9)).grid(row=1, column=0, sticky=tk.W, padx=2, pady=1)
-    steps_var = tk.IntVar(value=100)
+    steps_var = tk.IntVar(value=default_steps_per_epoch)
     steps_entry = ttk.Entry(params_grid, textvariable=steps_var, width=5)
     steps_entry.grid(row=1, column=1, sticky=tk.W, padx=2, pady=1)
     
     ttk.Label(params_grid, text="Init LR:", font=('TkDefaultFont', 9)).grid(row=1, column=2, sticky=tk.W, padx=2, pady=1)
-    init_lr_var = tk.DoubleVar(value=0.005)
+    init_lr_var = tk.DoubleVar(value=default_learning_rate)
     init_lr_entry = ttk.Entry(params_grid, textvariable=init_lr_var, width=6)
     init_lr_entry.grid(row=1, column=3, sticky=tk.W, padx=2, pady=1)
 
@@ -117,19 +117,17 @@ def create_gui():
     eta_label.pack(side=tk.RIGHT, padx=5)
 
     # Current LR display
-    current_lr_var = tk.StringVar(value="Current LR: 0.005")
+    current_lr_var = tk.StringVar(value=f"Current LR: {default_learning_rate}")
     root.current_lr_var = current_lr_var
     current_lr_label = ttk.Label(progress_info_frame, textvariable=current_lr_var)
     current_lr_label.pack(side=tk.BOTTOM, padx=5, pady=2)
 
-    # Model info
+    # Model info - SHORT VERSION
     model_info_frame = ttk.LabelFrame(control_frame, text="Model Information")
     model_info_frame.pack(fill=tk.X, padx=5, pady=5)
-    model_info_text = tk.Text(model_info_frame, height=5, width=30, wrap=tk.WORD)
+    model_info_text = tk.Text(model_info_frame, height=3, width=30, wrap=tk.WORD)
     model_info_text.pack(fill=tk.X, padx=5, pady=5)
-    model_info_text.insert(tk.END, "Enhanced FastPerceptualLoss Model\n")
-    model_info_text.insert(tk.END, "A lightweight, memory-efficient model designed to mimic VGG19 perceptual features.\n")
-    model_info_text.insert(tk.END, "Uses depthwise separable convolutions, channel attention, residual connections, and batch normalization.")
+    model_info_text.insert(tk.END, "FastPerceptualLoss Model: A lightweight model that mimics VGG19 perceptual features using advanced ML techniques.")
     model_info_text.config(state=tk.DISABLED)
 
     # Stats charts
@@ -165,22 +163,33 @@ def create_gui():
     def training_thread(dataset_folder, epochs, steps_per_epoch, initial_lr):
         vgg_model = VGG19(include_top=False, weights='imagenet', input_shape=(None, None, 3))
         vgg_model.trainable = False
-        model = create_fast_perceptual_model(input_shape=(None, None, 3))
-        log_queue.put(f"Total parameters: {model.count_params():,}")
-        train_fast_perceptual_model(
-            model,
-            vgg_model,
-            dataset_folder,
-            batch_size_var=batch_size_var,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            initial_lr=initial_lr,
-            canvas_frames=viz_frames,
-            progress_var=progress_var,
-            stats_canvas=stats_canvas,
-            stats_fig=stats_fig,
-            current_lr_var=current_lr_var
-        )
+        
+        # Create the enhanced perceptual loss model
+        try:
+            model = create_fast_perceptual_model(input_shape=(None, None, 3))
+            log_queue.put("Using enhanced perceptual loss model")
+            log_queue.put(f"Total parameters: {model.count_params():,}")
+            
+            # Start the training process
+            train_fast_perceptual_model(
+                model,
+                vgg_model,
+                dataset_folder,
+                batch_size_var=batch_size_var,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                initial_lr=initial_lr,
+                canvas_frames=viz_frames,
+                progress_var=progress_var,
+                stats_canvas=stats_canvas,
+                stats_fig=stats_fig,
+                current_lr_var=current_lr_var
+            )
+        except Exception as e:
+            log_queue.put(f"Error during training: {str(e)}")
+            # Re-enable start button
+            root.after(0, lambda: start_button.config(state=tk.NORMAL))
+            root.after(0, lambda: stop_button.config(state=tk.DISABLED))
 
     def start_training():
         global stop_training
@@ -199,9 +208,13 @@ def create_gui():
         epochs = epochs_var.get()
         steps_per_epoch = steps_var.get()
         initial_lr = init_lr_var.get()
+        
         start_button.config(state=tk.DISABLED)
         stop_button.config(state=tk.NORMAL)
-        threading.Thread(target=training_thread, args=(dataset_folder, epochs, steps_per_epoch, initial_lr)).start()
+        threading.Thread(
+            target=training_thread, 
+            args=(dataset_folder, epochs, steps_per_epoch, initial_lr)
+        ).start()
 
     def stop_training_func():
         global stop_training

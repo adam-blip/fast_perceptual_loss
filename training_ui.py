@@ -5,14 +5,13 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.callbacks import Callback
 from PIL import Image, ImageTk
-import uuid
-import json
+import io
 import os
 
 # Import the global variables
 from globals import log_queue, stop_training, current_batch_size
 
-# Update stats chart - now just loss and learning rate
+# Chart and visualization functions
 def update_stats_chart(fig, canvas, epochs, loss_values, lr_values):
     """Update the stats chart with current training data"""
     try:
@@ -52,8 +51,18 @@ def update_lr_plot(fig, canvas, epochs, loss_values, lr_values):
             ax2 = fig.axes[1]
             ax2.clear()
             
-            # Plot the learning rate
-            ax2.plot(epochs, lr_values, 'r-')
+            # Plot the learning rate - ensure same length arrays
+            if len(epochs) != len(lr_values):
+                # Trim the longer array to match the shorter one
+                length = min(len(epochs), len(lr_values))
+                epochs_plot = epochs[:length]
+                lr_plot = lr_values[:length]
+                log_queue.put(f"Fixed array length mismatch: {len(epochs)} vs {len(lr_values)}")
+            else:
+                epochs_plot = epochs
+                lr_plot = lr_values
+                
+            ax2.plot(epochs_plot, lr_plot, 'r-')
             ax2.set_title('Learning Rate')
             ax2.set_xlabel('Epoch')
             ax2.set_ylabel('Learning Rate')
@@ -65,237 +74,7 @@ def update_lr_plot(fig, canvas, epochs, loss_values, lr_values):
     except Exception as e:
         log_queue.put(f"Error updating LR plot: {str(e)}")
 
-# Advanced adaptive learning rate scheduler
-class AdaptiveLRScheduler(Callback):
-    def __init__(self, initial_lr=0.005, min_lr=1e-6, patience=3, 
-                 reduction_factor=0.5, warmup_epochs=3, cooldown=2,
-                 aggressive_reduction=0.2, recovery_factor=1.2, verbose=1,
-                 current_lr_var=None):
-        super(AdaptiveLRScheduler, self).__init__()
-        self.initial_lr = initial_lr
-        self.min_lr = min_lr
-        self.patience = patience
-        self.reduction_factor = reduction_factor
-        self.aggressive_reduction = aggressive_reduction
-        self.recovery_factor = recovery_factor
-        self.warmup_epochs = warmup_epochs
-        self.cooldown = cooldown
-        self.verbose = verbose
-        self.wait = 0
-        self.cooldown_counter = 0
-        self.best_loss = float('inf')
-        self.history = {'lr': [], 'loss': []}
-        self.current_lr_var = current_lr_var
-        
-    def on_train_begin(self, logs=None):
-        # Initialize model optimizer explicitly to avoid 'NoneType' errors
-        if not hasattr(self.model, 'optimizer') or self.model.optimizer is None:
-            log_queue.put("Warning: Optimizer not found in model. Initializing optimizer...")
-            self.model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=self.initial_lr),
-                loss='mse'
-            )
-        
-        # Verify optimizer has been initialized
-        if hasattr(self.model, 'optimizer'):
-            log_queue.put(f"Optimizer initialized successfully: {type(self.model.optimizer).__name__}")
-            # Set initial learning rate explicitly
-            tf.keras.backend.set_value(self.model.optimizer.lr, self.initial_lr)
-            # Update UI immediately
-            if self.current_lr_var:
-                try:
-                    self.current_lr_var.set(f"Current LR: {self.initial_lr:.6f}")
-                except Exception as e:
-                    log_queue.put(f"Error updating LR display: {str(e)}")
-        else:
-            log_queue.put("Warning: Failed to initialize optimizer!")
-        
-    def on_epoch_begin(self, epoch, logs=None):
-        # Safety check for optimizer existence
-        if not hasattr(self.model, 'optimizer') or self.model.optimizer is None:
-            log_queue.put("Warning: Optimizer not available at epoch begin!")
-            return
-            
-        # Warmup phase
-        if epoch < self.warmup_epochs:
-            lr = self.initial_lr * ((epoch + 1) / self.warmup_epochs)
-            tf.keras.backend.set_value(self.model.optimizer.lr, lr)
-            
-            if self.verbose > 0:
-                log_queue.put(f"Epoch {epoch+1}: Warmup phase, LR set to {lr:.6f}")
-        else:
-            # Get current learning rate
-            lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
-            # Just log the current rate
-            if self.verbose > 0:
-                log_queue.put(f"Epoch {epoch+1}: Current LR is {lr:.6f}")
-        
-        # Store learning rate for history
-        self.history['lr'].append(lr)
-        
-        # Update the UI variable with current learning rate
-        if self.current_lr_var:
-            try:
-                self.current_lr_var.set(f"Current LR: {lr:.6f}")
-            except Exception as e:
-                log_queue.put(f"Error updating LR display: {str(e)}")
-        
-    def on_epoch_end(self, epoch, logs=None):
-        # Safety check for optimizer existence
-        if not hasattr(self.model, 'optimizer') or self.model.optimizer is None:
-            log_queue.put("Warning: Optimizer not available at epoch end!")
-            return
-            
-        current_loss = logs.get('loss')
-        self.history['loss'].append(current_loss)
-        
-        # Skip LR adjustments during warmup
-        if epoch < self.warmup_epochs:
-            return
-        
-        # Get current learning rate
-        current_lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
-        
-        # If we're in cooldown period, just decrease counter and return
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            return
-        
-        # Check if loss improved
-        if current_loss < self.best_loss:
-            self.best_loss = current_loss
-            self.wait = 0
-            
-            # If we've had at least 5 epochs and loss is consistently decreasing
-            if len(self.history['loss']) >= 5 and all(self.history['loss'][-i] > self.history['loss'][-i+1] for i in range(5, 1, -1)):
-                # Try slightly increasing the learning rate if it's been decreasing steadily
-                new_lr = min(current_lr * self.recovery_factor, self.initial_lr)
-                if new_lr > current_lr and self.verbose > 0:
-                    log_queue.put(f"Loss steadily decreasing, slightly increasing LR to {new_lr:.6f}")
-                    tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
-                    
-                    # Update UI immediately
-                    if self.current_lr_var:
-                        try:
-                            self.current_lr_var.set(f"Current LR: {new_lr:.6f}")
-                        except Exception as e:
-                            log_queue.put(f"Error updating LR display: {str(e)}")
-        else:
-            self.wait += 1
-            
-            # Check for significant loss increase
-            if len(self.history['loss']) >= 2:
-                loss_ratio = current_loss / self.history['loss'][-2]
-                
-                # If loss increased significantly, reduce LR more aggressively
-                if loss_ratio > 1.1:  # 10% increase in loss
-                    new_lr = max(current_lr * self.aggressive_reduction, self.min_lr)
-                    if self.verbose > 0:
-                        log_queue.put(f"Significant loss increase detected ({loss_ratio:.2f}x), aggressively reducing LR to {new_lr:.6f}")
-                    tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
-                    
-                    # Update UI immediately
-                    if self.current_lr_var:
-                        try:
-                            self.current_lr_var.set(f"Current LR: {new_lr:.6f}")
-                        except Exception as e:
-                            log_queue.put(f"Error updating LR display: {str(e)}")
-                            
-                    self.cooldown_counter = self.cooldown
-                    self.wait = 0
-                    return
-            
-            # If patience is reached, reduce LR normally
-            if self.wait >= self.patience:
-                new_lr = max(current_lr * self.reduction_factor, self.min_lr)
-                if self.verbose > 0:
-                    log_queue.put(f"Patience reached, reducing LR to {new_lr:.6f}")
-                tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
-                
-                # Update UI immediately
-                if self.current_lr_var:
-                    try:
-                        self.current_lr_var.set(f"Current LR: {new_lr:.6f}")
-                    except Exception as e:
-                        log_queue.put(f"Error updating LR display: {str(e)}")
-                        
-                self.cooldown_counter = self.cooldown
-                self.wait = 0
-
-# Custom callback for batch size change
-class BatchSizeChangeCallback(Callback):
-    def __init__(self, dataset_gen_func):
-        super(BatchSizeChangeCallback, self).__init__()
-        self.dataset_gen_func = dataset_gen_func
-        self.last_batch_size = current_batch_size
-        
-    def on_epoch_end(self, epoch, logs=None):
-        global current_batch_size
-        
-        # Log the current batch size
-        log_queue.put(f"Current batch size: {current_batch_size}")
-        
-        # Check if batch size has changed
-        if self.last_batch_size != current_batch_size:
-            log_queue.put(f"Batch size changed from {self.last_batch_size} to {current_batch_size}")
-            
-            # Create a new dataset with the updated batch size
-            try:
-                new_dataset = self.dataset_gen_func(current_batch_size)
-                
-                # Store the new dataset for the next fit call
-                self._data = new_dataset
-                
-                # Notify user about the change
-                log_queue.put(f"Dataset updated with new batch size: {current_batch_size}")
-            except Exception as e:
-                log_queue.put(f"Error creating dataset with new batch size: {str(e)}")
-            
-        # Save the current batch size for the next epoch
-        self.last_batch_size = current_batch_size
-        
-    def on_epoch_begin(self, epoch, logs=None):
-        # Apply the new dataset at the beginning of an epoch if it exists
-        if hasattr(self, '_data'):
-            try:
-                self.model._dataset = self._data
-                log_queue.put(f"Applying new batch size {current_batch_size} for epoch {epoch+1}")
-                delattr(self, '_data')  # Clear the stored dataset after applying
-            except Exception as e:
-                log_queue.put(f"Error applying new dataset: {str(e)}")
-
-# Custom logger callback
-class LoggerCallback(Callback):
-    def on_batch_end(self, batch, logs=None):
-        if batch % 10 == 0:  # Log every 10 batches
-            try:
-                log_queue.put(f"Batch {batch} - Loss: {logs.get('loss'):.6f}")
-            except Exception as e:
-                log_queue.put(f"Error in logger callback: {str(e)}")
-        
-        if stop_training:
-            self.model.stop_training = True
-
-# Summary stats callback for model monitoring
-class ModelStatsCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        if epoch % 10 == 0:  # Every 10 epochs
-            try:
-                # Calculate and log model metrics
-                log_queue.put(f"Model metrics at epoch {epoch}:")
-                
-                # Calculate parameter count
-                trainable_params = sum([tf.keras.backend.count_params(w) for w in self.model.trainable_weights])
-                non_trainable_params = sum([tf.keras.backend.count_params(w) for w in self.model.non_trainable_weights])
-                
-                log_queue.put(f"  Trainable params: {trainable_params:,}")
-                log_queue.put(f"  Non-trainable params: {non_trainable_params:,}")
-                log_queue.put(f"  Total params: {trainable_params + non_trainable_params:,}")
-                log_queue.put(f"  Current loss: {logs.get('loss'):.6f}")
-            except Exception as e:
-                log_queue.put(f"Error in model stats callback: {str(e)}")
-
-# Thread-safe custom callback to display a single sample patch with LR/loss diagram
+# Thread-safe custom callback to display a single sample patch without saving
 class AdvancedVisualizationCallback(Callback):
     def __init__(self, dataset, vgg_submodel, canvas_frame, root, adaptive_lr_scheduler=None):
         super(AdvancedVisualizationCallback, self).__init__()
@@ -308,6 +87,9 @@ class AdvancedVisualizationCallback(Callback):
         self.losses = []
         self.learning_rates = []
         self.epochs = []
+        self.photo_img = None  # Keep reference to prevent garbage collection
+        self.last_width = 0
+        self.last_height = 0
     
     def on_train_begin(self, logs=None):
         # Make canvas frame destroy_widgets method available
@@ -334,16 +116,28 @@ class AdvancedVisualizationCallback(Callback):
                 log_queue.put(f"Error getting sample data: {str(e)}")
                 return
         
-        # Store current learning rate
+        # Store current learning rate with improved error handling
         try:
             # Safely get current learning rate
             if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
                 current_lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
                 self.learning_rates.append(current_lr)
             else:
-                log_queue.put("Warning: Unable to get current learning rate in visualization callback")
+                # Use previous learning rate if available, otherwise use a default
+                if self.learning_rates and len(self.learning_rates) > 0:
+                    previous_lr = self.learning_rates[-1]
+                    self.learning_rates.append(previous_lr)
+                else:
+                    # Use initial LR as fallback
+                    fallback_lr = 0.001  # Default initial LR
+                    self.learning_rates.append(fallback_lr)
         except Exception as e:
-            log_queue.put(f"Error storing learning rate: {str(e)}")
+            log_queue.put(f"Error retrieving learning rate: {str(e)}")
+            # Still add a value to maintain array length
+            if self.learning_rates and len(self.learning_rates) > 0:
+                self.learning_rates.append(self.learning_rates[-1])
+            else:
+                self.learning_rates.append(0.001)  # Default initial LR
 
     def on_epoch_end(self, epoch, logs=None):
         if stop_training:
@@ -355,18 +149,19 @@ class AdvancedVisualizationCallback(Callback):
             self.losses.append(current_loss)
             self.epochs.append(epoch)
             
-            log_queue.put(f"Epoch {epoch+1} completed. Loss: {current_loss:.6f}")
-            
             if not self.sample_data:
                 return
 
             # Get the prediction from the lightweight model
             x, y_true = self.sample_data[0]
             x_input = tf.expand_dims(x, axis=0)
-            y_pred = self.model(x_input)[0]
             
-            # Get current learning rate
-            current_lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
+            try:
+                # Wrap in try/except in case model prediction fails
+                y_pred = self.model(x_input)[0]
+            except Exception as e:
+                log_queue.put(f"Error during model prediction: {str(e)}")
+                return
             
             # PATCH VISUALIZATION INCLUDING FEATURE DIFFERENCE
             patches_fig = plt.figure(figsize=(10, 3))  # Wider and shorter figure for horizontal layout
@@ -407,49 +202,50 @@ class AdvancedVisualizationCallback(Callback):
             # Adjust layout for patch visualization
             patches_fig.tight_layout()
             
-            # Save the figure with a unique filename
-            unique_id = str(uuid.uuid4())[:8]  # Short UUID for filename
-            patches_file = f'vis_patches_{unique_id}_epoch_{epoch+1}.png'
-            patches_fig.savefig(patches_file, bbox_inches='tight', dpi=120)
+            # Instead of saving to file, render directly to memory
+            # Create a BytesIO object to hold the image data
+            buf = io.BytesIO()
+            patches_fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+            buf.seek(0)
+            
+            # Update the UI directly with this image
+            self.root.after(0, lambda: self.update_canvas_from_buffer(buf))
             plt.close(patches_fig)
             
-            # Update the patch visualization in the main thread
-            self.root.after(0, self.update_canvas, patches_file)
-            
             # Update learning rate plot frequently
-            # Update every epoch instead of waiting for HistoryCallback
             if hasattr(self.root, 'stats_fig') and hasattr(self.root, 'stats_canvas'):
+                # Ensure arrays are the same length before updating
+                epochs_to_use = self.epochs
+                lr_to_use = self.learning_rates[:len(epochs_to_use)]
+                
                 self.root.after(0, lambda: update_lr_plot(
                     self.root.stats_fig,
                     self.root.stats_canvas,
-                    self.epochs,
-                    self.losses,
-                    self.learning_rates
+                    epochs_to_use,
+                    self.losses[:len(epochs_to_use)],
+                    lr_to_use
                 ))
         except Exception as e:
             log_queue.put(f"Error in visualization callback: {str(e)}")
-        
-    def update_canvas(self, temp_file):
-        """
-        Update the canvas in the main thread
-        """
+    
+    def update_canvas_from_buffer(self, buf):
+        """Update the canvas directly from a buffer"""
         try:
-            # Import PIL.ImageTk here to ensure it's available
-            from PIL import ImageTk
-            
             # Clear the frame
             for widget in self.canvas_frame.winfo_children():
                 widget.destroy()
             
-            # Open the saved image with PIL (safer for threading)
-            img = Image.open(temp_file)
+            # Open the image from buffer
+            img = Image.open(buf)
             
             # Create a label to display the image
             label = tk.Label(self.canvas_frame)
             label.pack(fill=tk.BOTH, expand=True)
             
+            # Make the visualization responsive to window resizing
+            self.canvas_frame.update_idletasks()  # Force layout update
+            
             # Calculate the available space
-            self.canvas_frame.update()
             frame_width = self.canvas_frame.winfo_width()
             frame_height = self.canvas_frame.winfo_height()
             
@@ -457,7 +253,7 @@ class AdvancedVisualizationCallback(Callback):
             img_width, img_height = img.size
             width_ratio = frame_width / img_width
             height_ratio = frame_height / img_height
-            scale_factor = min(width_ratio, height_ratio)
+            scale_factor = min(width_ratio, height_ratio, 1.0)  # Don't upscale if image is smaller
             
             # Calculate new dimensions
             new_width = int(img_width * scale_factor)
@@ -467,70 +263,54 @@ class AdvancedVisualizationCallback(Callback):
             resized_img = img.resize((new_width, new_height), Image.LANCZOS)
             
             # Convert to PhotoImage and display
-            photo_img = ImageTk.PhotoImage(resized_img)
-            label.config(image=photo_img)
-            label.image = photo_img  # Keep reference to prevent garbage collection
+            self.photo_img = ImageTk.PhotoImage(resized_img)
+            label.config(image=self.photo_img)
             
-            # Keep the file for later reference (don't delete)
-            # This allows reviewing all visualizations after training
-            log_queue.put(f"Visualization saved to {temp_file}")
+            # Add resize binding to the canvas frame
+            self.canvas_frame.bind("<Configure>", self.on_frame_resize)
+            
+            # Store original image and buffer for resize
+            self.original_img = img
+            self.img_buffer = buf
+            
         except Exception as e:
             log_queue.put(f"Error updating visualization: {str(e)}")
-
-# Progress callback to update the progress bar, percentage and ETA
-class ProgressCallback(Callback):
-    def __init__(self, root, total_epochs):
-        super(ProgressCallback, self).__init__()
-        self.root = root
-        self.total_epochs = total_epochs
-        self.start_time = time.time()
-        self.epoch_times = []
-        
-    def on_epoch_begin(self, epoch, logs=None):
-        if not self.root:
-            return
-            
-        try:
-            # Get progress value
-            progress_value = (epoch) / self.total_epochs * 100
-            
-            # Direct use of progress_var if passed via train_fast_perceptual_model 
-            if hasattr(self.root, 'progress_var') and self.root.progress_var:
-                self.root.after(0, lambda: self.root.progress_var.set(progress_value))
-            
-            # Direct use of UI elements if passed through
-            if hasattr(self.root, 'percentage_var') and self.root.percentage_var:
-                self.root.after(0, lambda: self.root.percentage_var.set(f"{progress_value:.1f}%"))
-                
-            if epoch > 0 and hasattr(self.root, 'eta_var') and self.root.eta_var:
-                # Calculate average epoch time
-                if len(self.epoch_times) > 0:
-                    avg_epoch_time = sum(self.epoch_times) / len(self.epoch_times)
-                    remaining_epochs = self.total_epochs - (epoch)
-                    estimated_seconds = avg_epoch_time * remaining_epochs
-                    
-                    # Format ETA as hours:minutes:seconds
-                    eta_str = str(datetime.timedelta(seconds=int(estimated_seconds)))
-                    self.root.after(0, lambda: self.root.eta_var.set(f"ETA: {eta_str}"))
-        except Exception as e:
-            log_queue.put(f"Error updating progress: {str(e)}")
     
-    def on_epoch_end(self, epoch, logs=None):
-        # Record epoch time for ETA calculation
-        if epoch == 0:
-            self.start_time = time.time()  # Reset start time after first epoch
-        else:
-            epoch_time = time.time() - self.start_time
-            self.epoch_times.append(epoch_time)
-            self.start_time = time.time()  # Reset for next epoch
-            
-        # Update progress again at end of epoch
-        if self.root:
-            progress_value = (epoch + 1) / self.total_epochs * 100
-            if hasattr(self.root, 'progress_var') and self.root.progress_var:
-                self.root.after(0, lambda: self.root.progress_var.set(progress_value))
-            if hasattr(self.root, 'percentage_var') and self.root.percentage_var:
-                self.root.after(0, lambda: self.root.percentage_var.set(f"{progress_value:.1f}%"))
-            
-    def on_train_end(self, logs=None):
-        log_queue.put("Training finished!")
+    def on_frame_resize(self, event=None):
+        """Handle frame resize events to scale the visualization properly"""
+        if hasattr(self, 'original_img') and self.original_img:
+            try:
+                # Calculate the new available space
+                frame_width = self.canvas_frame.winfo_width() 
+                frame_height = self.canvas_frame.winfo_height()
+                
+                # Get original image dimensions
+                img_width, img_height = self.original_img.size
+                
+                # Calculate new scaling factor
+                width_ratio = frame_width / img_width
+                height_ratio = frame_height / img_height
+                scale_factor = min(width_ratio, height_ratio, 1.0)  # Don't upscale if image is smaller
+                
+                # Calculate new dimensions
+                new_width = int(img_width * scale_factor)
+                new_height = int(img_height * scale_factor)
+                
+                # Only resize if dimensions changed significantly
+                if abs(new_width - getattr(self, 'last_width', 0)) > 10 or abs(new_height - getattr(self, 'last_height', 0)) > 10:
+                    # Resize the image to fit the frame
+                    resized_img = self.original_img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Find the label widget
+                    for widget in self.canvas_frame.winfo_children():
+                        if isinstance(widget, tk.Label):
+                            # Update the PhotoImage
+                            self.photo_img = ImageTk.PhotoImage(resized_img)
+                            widget.config(image=self.photo_img)
+                            
+                            # Store current dimensions
+                            self.last_width = new_width
+                            self.last_height = new_height
+                            break
+            except Exception as e:
+                log_queue.put(f"Error resizing visualization: {str(e)}")

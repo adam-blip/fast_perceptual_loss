@@ -12,21 +12,24 @@ import matplotlib.pyplot as plt
 import time
 import datetime
 import uuid
-import json
+import random
+import string
 
 # Import the global variables from globals.py
-from globals import log_queue, stop_training, current_batch_size
+from globals import log_queue, stop_training, current_batch_size, default_epochs, default_steps_per_epoch, default_learning_rate, default_image_size
 
-# Import UI-related functionality from training_ui.py
-from training_ui import (
+# Import custom layers from model.py
+from model import WeightedAddLayer, MeanReduceLayer, MaxReduceLayer, create_fast_perceptual_model
+
+# Import UI-related functionality from both files
+from training_ui import update_stats_chart, AdvancedVisualizationCallback
+from training_helper import (
     LoggerCallback, 
     ProgressCallback, 
-    AdvancedVisualizationCallback,
     ModelStatsCallback,
-    BatchSizeChangeCallback,
-    AdaptiveLRScheduler,
-    update_stats_chart
+    BatchSizeChangeCallback
 )
+from training_scheduler import ImprovedAdaptiveLRScheduler
 
 # Safer way to get entry widget values
 def get_entry_value(master, widget_name):
@@ -38,15 +41,15 @@ def get_entry_value(master, widget_name):
             # Try to get and convert its value
             value = widget.get()
             return int(value)
-    except (ValueError, KeyError, AttributeError, tk.TclError):
+    except (ValueError, KeyError, AttributeError, tf.errors.OpError):
         # Return None if anything goes wrong
         return None
     return None
 
 # Train the fast perceptual loss model
 def train_fast_perceptual_model(model, vgg_model, dataset_folder, 
-                           batch_size_var, epochs=250, steps_per_epoch=100, 
-                           initial_lr=0.005,
+                           batch_size_var, epochs=default_epochs, steps_per_epoch=default_steps_per_epoch, 
+                           initial_lr=default_learning_rate,
                            canvas_frames=None, progress_var=None,
                            stats_canvas=None, stats_fig=None,
                            current_lr_var=None):
@@ -72,6 +75,9 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     # Create a sub-model of VGG19 up to block3_conv3
     vgg_submodel = Model(inputs=vgg_model.input, outputs=vgg_model.get_layer('block3_conv3').output)
     vgg_submodel.trainable = False
+    
+    # Print VGG model dimensions to understand downsampling ratio
+    log_queue.put(f"VGG19 Submodel: Input shape {vgg_model.input.shape}, Output shape {vgg_submodel.output.shape}")
 
     # Get all JPEG files from the dataset folder
     image_files = [f for f in os.listdir(dataset_folder) if f.lower().endswith(('.jpeg', '.jpg', '.png'))]
@@ -83,11 +89,9 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     # Prepare training data generator with augmentation using Pillow
     def generate_training_data():
         # Target size for final patches
-        target_size = 512
+        target_size = default_image_size
         # Use larger patch size before rotation to avoid black borders
         extraction_size = int(target_size * 1.5)  # 50% larger to allow for rotation
-        
-        log_queue.put(f"Generating augmented patches of size {target_size}x{target_size} using Pillow")
         
         # Pillow-based augmentation function
         def augment_with_pillow(image_array):
@@ -153,9 +157,11 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
                 # Extract patch (using numpy slicing for simplicity)
                 patch = image_tensor[h_start:h_start+extraction_size, w_start:w_start+extraction_size, :]
             else:
-                # If image is too small, resize it to extraction_size with padding
-                patch = tf.image.resize_with_pad(image_tensor, extraction_size, extraction_size)
-                
+                # Force resize to square dimensions before padding
+                min_dim = min(height, width)
+                patch = tf.image.resize_with_crop_or_pad(image_tensor, min_dim, min_dim)
+                patch = tf.image.resize(patch, [extraction_size, extraction_size])
+            
             return patch
         
         # MixUp data augmentation function defined inside generate_training_data scope
@@ -208,6 +214,7 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
                     recent_images.append(final_patch)
                     
                     # Extract VGG19 features as targets using the sub-model
+                    # Use the SAME input for both models
                     vgg_features = vgg_submodel(tf.expand_dims(final_patch, axis=0))[0]
                     
                     yield final_patch, vgg_features
@@ -215,15 +222,24 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
                     log_queue.put(f"Error processing {image_file}: {e}")
                     continue  # Skip this image and move to the next one
     
-    # Function to create a dataset with a specific batch size
+    # Function to create a dataset with a specific batch size - FIXED FOR HDF5 ERRORS
     def create_dataset(batch_size):
-        return tf.data.Dataset.from_generator(
+        # Generate a truly unique name with timestamp and random component to avoid conflicts
+        timestamp = int(time.time())
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        unique_name = f"dataset_{timestamp}_{random_suffix}"
+        
+        # Create the dataset with the guaranteed unique name
+        dataset = tf.data.Dataset.from_generator(
             generate_training_data,
             output_signature=(
                 tf.TensorSpec(shape=(None, None, 3), dtype=tf.float32),
                 tf.TensorSpec(shape=(None, None, 256), dtype=tf.float32)  # Match VGG19 block3_conv3 output
-            )
+            ),
+            name=unique_name
         ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
     
     # Compile the model with the specified initial learning rate
     log_queue.put(f"Initializing optimizer with learning rate: {initial_lr}")
@@ -238,44 +254,32 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     
     # Compile with the optimizer
     model.compile(optimizer=optimizer, loss='mse')
+    
+    # Force optimizer initialization with a dummy batch to avoid warnings
+    try:
+        # Create dummy data with dimensions that match the target size/4
+        input_size = default_image_size
+        output_size = input_size // 4  # Expected output size (128x128)
+        
+        dummy_x = tf.zeros((1, input_size, input_size, 3))
+        dummy_y = tf.zeros((1, output_size, output_size, 256))
+        
+        # Run one training step to initialize optimizer
+        model.train_on_batch(dummy_x, dummy_y)
+        log_queue.put(f"Optimizer initialized with dummy batch")
+    except Exception as e:
+        log_queue.put(f"Error during optimizer initialization: {str(e)}")
 
     # Define checkpoint directory
     checkpoint_dir = './Checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Define directory for training history
-    history_dir = './History'
-    os.makedirs(history_dir, exist_ok=True)
-    
-    # Create a unique filename for this training run
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    history_file = os.path.join(history_dir, f'training_history_{timestamp}.json')
-    
-    # Initialize history dictionary for JSON file
-    history_data = {
-        'epochs': [],
-        'loss': [],
-        'learning_rate': [],
-        'batch_sizes': [],  # Track batch size changes
-        'timestamp': timestamp,
-        'model_info': {
-            'parameters': model.count_params(),
-            'initial_lr': initial_lr,
-            'initial_batch_size': current_batch_size
-        }
-    }
-    
-    # Function to save history to JSON
-    def save_history_to_json():
-        try:
-            with open(history_file, 'w') as f:
-                json.dump(history_data, f, indent=4)
-            log_queue.put(f"Training history saved to {history_file}")
-        except Exception as e:
-            log_queue.put(f"Error saving history: {str(e)}")
-    
-    # Define checkpoint logic
-    checkpoint_filepath = os.path.join(checkpoint_dir, 'fast_perceptual_loss_epoch_{epoch:02d}.h5')
+    # Define checkpoint logic with unique file naming to avoid HDF5 conflicts
+    timestamp = int(time.time())
+    checkpoint_filepath = os.path.join(
+        checkpoint_dir, 
+        f'fast_perceptual_loss_epoch_{{epoch:02d}}_{timestamp}.h5'
+    )
     model_checkpoint_callback = ModelCheckpoint(
         filepath=checkpoint_filepath,
         save_weights_only=False,  # Save the entire model
@@ -290,16 +294,61 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('fast_perceptual_loss_epoch_')] if os.path.exists(checkpoint_dir) else []
     if checkpoint_files:
         # Extract epoch numbers
-        epoch_numbers = [int(f.split('_')[-1].split('.')[0]) for f in checkpoint_files]
-        latest_epoch = max(epoch_numbers)
-        latest_checkpoint = f'fast_perceptual_loss_epoch_{latest_epoch:02d}.h5'
-        latest_checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
-        log_queue.put(f"Latest checkpoint found: {latest_checkpoint_path} (Epoch {latest_epoch})")
-        
-        # Load the model from the latest checkpoint
-        model = tf.keras.models.load_model(latest_checkpoint_path)
-        start_epoch = latest_epoch
-        log_queue.put(f"Training will resume from epoch {start_epoch + 1}")
+        epoch_numbers = []
+        for f in checkpoint_files:
+            try:
+                # Handle both naming formats (with and without timestamp)
+                if '_' in f.split('epoch_')[1]:
+                    epoch_num = int(f.split('epoch_')[1].split('_')[0])
+                else:
+                    epoch_num = int(f.split('epoch_')[1].split('.')[0])
+                epoch_numbers.append(epoch_num)
+            except (IndexError, ValueError):
+                continue
+                
+        if epoch_numbers:
+            latest_epoch = max(epoch_numbers)
+            # Find the exact filename with this epoch number (could have different timestamps)
+            matching_files = [f for f in checkpoint_files if f'epoch_{latest_epoch:02d}' in f]
+            if matching_files:
+                latest_checkpoint = matching_files[0]  # Use the first matching file
+                latest_checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+                log_queue.put(f"Latest checkpoint found: {latest_checkpoint_path} (Epoch {latest_epoch})")
+                
+                # Register custom objects before loading the model
+                custom_objects = {
+                    'WeightedAddLayer': WeightedAddLayer,
+                    'MeanReduceLayer': MeanReduceLayer,
+                    'MaxReduceLayer': MaxReduceLayer
+                }
+                
+                try:
+                    # Load the model from the latest checkpoint with custom objects
+                    model = tf.keras.models.load_model(latest_checkpoint_path, custom_objects=custom_objects)
+                    start_epoch = latest_epoch
+                    log_queue.put(f"Training will resume from epoch {start_epoch + 1}")
+                    
+                    # Re-compile the model after loading to ensure optimizer is initialized
+                    model.compile(optimizer=optimizer, loss='mse')
+                    
+                    # Re-initialize optimizer with a dummy batch
+                    try:
+                        # Create dummy data with dimensions that match the target size/4
+                        input_size = default_image_size
+                        output_size = input_size // 4  # Expected output size
+                        
+                        dummy_x = tf.zeros((1, input_size, input_size, 3))
+                        dummy_y = tf.zeros((1, output_size, output_size, 256))
+                        
+                        # Run one training step to initialize optimizer
+                        model.train_on_batch(dummy_x, dummy_y)
+                        log_queue.put("Optimizer re-initialized successfully after loading checkpoint")
+                    except Exception as e:
+                        log_queue.put(f"Error during optimizer re-initialization: {str(e)}")
+                except Exception as e:
+                    log_queue.put(f"Error loading checkpoint: {str(e)}, starting from scratch")
+        else:
+            log_queue.put("No valid checkpoints found. Starting training from scratch.")
     else:
         log_queue.put("No checkpoints found. Starting training from scratch.")
 
@@ -310,22 +359,31 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     # Use only the first frame for visualization
     viz_frame = canvas_frames[0] if canvas_frames else None
     
-    # Create adaptive learning rate scheduler with improved parameters
-    adaptive_lr = AdaptiveLRScheduler(
+    # Create improved adaptive learning rate scheduler with enhanced parameters
+    adaptive_lr = ImprovedAdaptiveLRScheduler(
         initial_lr=initial_lr,
-        min_lr=1e-6,
-        patience=3,                # Reduced patience for quicker response
-        reduction_factor=0.7,      # Less aggressive reduction
-        aggressive_reduction=0.3,  # More moderate aggressive reduction
-        recovery_factor=1.03,     # More gentle recovery
-        warmup_epochs=2,           # Shorter warmup
-        cooldown=1,                # Shorter cooldown
+        min_lr=1e-7,               # Lower min LR for finer control
+        patience=2,                # More responsive patience
+        reduction_factor=0.4,      # More aggressive reduction
+        aggressive_reduction=0.3,  # Keep moderate aggressive reduction
+        recovery_factor=1.05,      # Keep gentle recovery
+        warmup_epochs=2,           # Keep shorter warmup
+        cooldown=1,                # Keep shorter cooldown
         verbose=1,                 # Keep verbose mode
-        current_lr_var=current_lr_var  # Pass UI variable
+        current_lr_var=current_lr_var,  # Pass UI variable
+        early_reaction_threshold=0.03,  # Detect trends early
+        loss_memory_factor=0.7,         # Smooth loss tracking
+        trend_detection_window=3        # How many epochs to consider for trend
     )
     
-    # Custom callback for JSON history tracking with more frequent updates
-    class HistoryCallback(Callback):
+    # Modified DataTrackingCallback to track and update charts but not save history
+    class DataTrackingCallback(Callback):
+        def __init__(self):
+            super(DataTrackingCallback, self).__init__()
+            self.epochs = []
+            self.losses = []
+            self.learning_rates = []
+            
         def on_epoch_end(self, epoch, logs=None):
             try:
                 # Get current learning rate - with error handling
@@ -335,71 +393,43 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
                     # Fall back to initial learning rate if optimizer is not available
                     current_lr = initial_lr  
                 
-                # Update history data
-                history_data['epochs'].append(epoch)
-                history_data['loss'].append(float(logs.get('loss', 0.0)))
-                history_data['learning_rate'].append(current_lr)
-                history_data['batch_sizes'].append(current_batch_size)  # Track batch size
+                # Update tracked data
+                self.epochs.append(epoch)
+                self.losses.append(float(logs.get('loss', 0.0)))
+                self.learning_rates.append(current_lr)
                 
                 # Update stats chart more frequently
                 if stats_fig and stats_canvas and root:
                     root.after(0, lambda: update_stats_chart(
                         stats_fig, 
                         stats_canvas, 
-                        history_data['epochs'],
-                        history_data['loss'],
-                        history_data['learning_rate']
+                        self.epochs,
+                        self.losses,
+                        self.learning_rates
                     ))
-                
-                # Save history to JSON file every 2 epochs instead of 5
-                if epoch % 2 == 0 or epoch == self.params.get('epochs', epochs) - 1:
-                    save_history_to_json()
             except Exception as e:
-                log_queue.put(f"Error in history callback: {str(e)}")
-                # Still try to update with available data
-                save_history_to_json()
+                log_queue.put(f"Error in data tracking callback: {str(e)}")
     
     # Setup the advanced visualization callback
     visualization_callback = AdvancedVisualizationCallback(
         dataset, vgg_submodel, viz_frame, root, adaptive_lr
     ) if viz_frame and root else None
     
-    # Create a more frequent batch-level learning rate update callback
-    class LRUpdateCallback(Callback):
-        def __init__(self, update_freq=5):
-            super(LRUpdateCallback, self).__init__()
-            self.update_freq = update_freq
-            self.batch_count = 0
-            
-        def on_batch_end(self, batch, logs=None):
-            self.batch_count += 1
-            # Update current learning rate display every few batches
-            if self.batch_count % self.update_freq == 0 and current_lr_var and root:
-                try:
-                    # Get current learning rate
-                    if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
-                        curr_lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
-                        root.after(0, lambda: current_lr_var.set(f"Current LR: {curr_lr:.6f}"))
-                except Exception as e:
-                    log_queue.put(f"Error updating LR display: {str(e)}")
-    
     logger_callback = LoggerCallback()
     stats_callback = ModelStatsCallback()
     batch_size_change_callback = BatchSizeChangeCallback(create_dataset)
     progress_callback = ProgressCallback(root, epochs)
-    history_callback = HistoryCallback()
-    lr_update_callback = LRUpdateCallback(update_freq=3)  # Update LR display every 3 batches
+    data_tracking_callback = DataTrackingCallback()
     
     # Add all callbacks
     callbacks = [
-        model_checkpoint_callback,   # Save checkpoints
-        logger_callback,             # Log progress
-        progress_callback,           # Update progress bar
-        stats_callback,              # Model statistics
-        batch_size_change_callback,  # Handle batch size changes
-        adaptive_lr,                 # Adaptive learning rate scheduler
-        history_callback,            # JSON history tracker
-        lr_update_callback           # More frequent LR updates
+        model_checkpoint_callback,    # Save checkpoints
+        logger_callback,              # Log progress
+        progress_callback,            # Update progress bar
+        stats_callback,               # Model statistics
+        batch_size_change_callback,   # Handle batch size changes
+        adaptive_lr,                  # Adaptive learning rate scheduler
+        data_tracking_callback,       # Data tracking for charts
     ]
     
     # Only add visualization if we have a frame
@@ -478,7 +508,24 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
                 )
             except Exception as e:
                 log_queue.put(f"Error during model.fit: {str(e)}")
-                # Try to continue with next epoch
+                # Try to recover from dataset error
+                if "name already exists" in str(e):
+                    log_queue.put("Attempting to recover from dataset naming conflict...")
+                    # Create a new dataset with a definitely unique name
+                    try:
+                        active_dataset = create_dataset(current_batch_size)
+                        log_queue.put("Successfully recreated dataset with unique name")
+                        # Continue with next epoch
+                        current_epoch += 1
+                        continue
+                    except Exception as recovery_error:
+                        log_queue.put(f"Failed to recover: {str(recovery_error)}")
+                        break
+                else:
+                    # For other errors, try to continue with next epoch
+                    log_queue.put(f"Will attempt to continue with next epoch")
+                    current_epoch += 1
+                    continue
                 
             # Increment epoch counter
             current_epoch += 1
@@ -493,14 +540,25 @@ def train_fast_perceptual_model(model, vgg_model, dataset_folder,
     finally:
         # Call on_train_end for all callbacks
         for callback in callbacks:
-            callback.on_train_end({})
+            try:
+                callback.on_train_end({})
+            except Exception as e:
+                log_queue.put(f"Error in callback on_train_end: {str(e)}")
 
-    # Save the final trained model
-    final_model_path = os.path.join(checkpoint_dir, 'fast_perceptual_loss_final.h5')
-    model.save(final_model_path)
-    log_queue.put(f"FastPerceptualLoss model trained and saved to {final_model_path}.")
-    
-    # Save final history to JSON
-    save_history_to_json()
+    # Save the final trained model with unique timestamp to avoid conflicts
+    final_timestamp = int(time.time())
+    final_model_path = os.path.join(checkpoint_dir, f'fast_perceptual_loss_final_{final_timestamp}.h5')
+    try:
+        model.save(final_model_path)
+        log_queue.put(f"FastPerceptualLoss model trained and saved to {final_model_path}.")
+    except Exception as e:
+        log_queue.put(f"Error saving final model: {str(e)}")
+        # Try alternate save methods if the first fails
+        try:
+            log_queue.put("Attempting to save with different method...")
+            model.save_weights(os.path.join(checkpoint_dir, f'fast_perceptual_loss_weights_{final_timestamp}.h5'))
+            log_queue.put(f"Model weights saved successfully.")
+        except Exception as e2:
+            log_queue.put(f"Failed to save weights as well: {str(e2)}")
     
     return model
